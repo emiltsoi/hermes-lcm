@@ -1899,8 +1899,8 @@ class LCMEngine(ContextEngine):
                         source_state = None
 
         conversation_id = (
-            kwargs.get("conversation_id")
-            or (source_state.conversation_id if source_state else None)
+            (source_state.conversation_id if source_state else None)
+            or kwargs.get("conversation_id")
             or self._conversation_id
             or source_session_id
             or old_session_id
