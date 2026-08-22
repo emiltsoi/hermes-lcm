@@ -1902,10 +1902,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         state = self._lifecycle.get_by_conversation(self._pending_reset_conversation_id)
         frontier_store_id = self._pending_reset_frontier_store_id
         if state is not None and state.current_session_id == session_id:
-            frontier_store_id = max(
-                frontier_store_id,
-                int(state.current_frontier_store_id or 0),
+            # The pending-reset session is STILL the conversation's current
+            # active binding — this is a gateway restart/resume, NOT a real
+            # session boundary. Finalizing it would orphan the live session's
+            # raw messages and reset its frontier to 0 (2026-08-23 bug: every
+            # restart re-finalized the active session, so the engine treated
+            # all messages as new debt and entered constant compression
+            # churn). Keep the session active and drop the pending reset.
+            logger.warning(
+                "LCM pending-reset boundary skipped: session %s is still the "
+                "current active binding (gateway restart/resume, not a session "
+                "boundary); keeping it active",
+                session_id,
             )
+            self._clear_pending_reset_boundary()
+            return
         self._lifecycle.finalize_session(
             self._pending_reset_conversation_id,
             self._pending_reset_session_id,
@@ -3400,11 +3411,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     raise
 
                 try:
-                    self._lifecycle.finalize_session(
-                        self._conversation_id,
-                        session_id,
-                        frontier_store_id=self._last_compacted_store_id,
+                    # Only finalize when compaction actually produced a frontier
+                    # or summary nodes exist. A session ending with ZERO
+                    # compaction (gateway restart/crash, session-end without a
+                    # boundary) must stay the live session — finalizing it
+                    # orphans its raw messages and permanently disables
+                    # compression on the next process (2026-08-22/23 bug:
+                    # every restart created a new empty lifecycle row and
+                    # froze the real session as last_finalized_session_id).
+                    has_compaction = (
+                        int(self._last_compacted_store_id or 0) > 0
+                        or bool(self._dag.get_session_nodes(session_id))
                     )
+                    if has_compaction:
+                        self._lifecycle.finalize_session(
+                            self._conversation_id,
+                            session_id,
+                            frontier_store_id=self._last_compacted_store_id,
+                        )
+                    else:
+                        logger.warning(
+                            "LCM session-end %s had zero compaction; leaving as active "
+                            "session so a restart rebinds instead of finalizing it",
+                            session_id,
+                        )
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end lifecycle finalization interrupted; "
