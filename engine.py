@@ -1734,7 +1734,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # bind_session zeroed the frontier because the row was finalized;
             # restore it from the finalized marker so raw rows at or below it
             # are not reclassified as new compression debt on the resumed run.
-            restored = self._lifecycle.advance_frontier(
+            # The finalized marker and any stale debt are also cleared in the
+            # same write: leaving last_finalized_session_id == the live session
+            # makes the row look already-finalized, so downstream logic treats
+            # the 42K+ live raw messages as UNBOUND backlog and churns compress
+            # preflights/refusals. resume_finalized_session is guarded on
+            # current_session_id == session_id, so a genuine new-session
+            # boundary (last_finalized points at the OLD id) is left untouched.
+            restored = self._lifecycle.resume_finalized_session(
                 state.conversation_id,
                 session_id,
                 int(prior_state.last_finalized_frontier_store_id),

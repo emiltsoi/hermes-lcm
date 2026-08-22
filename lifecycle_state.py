@@ -877,3 +877,53 @@ class LifecycleStateStore:
                 return self.get_by_conversation(conversation_id)
             conn.commit()
             return self.get_by_conversation(conversation_id)
+
+    @_synchronized
+    def resume_finalized_session(
+        self,
+        conversation_id: str | None,
+        session_id: str,
+        frontier_store_id: int,
+    ) -> LifecycleState | None:
+        """Promote a shutdown-finalized marker back to the active binding.
+
+        A gateway restart/resume of the SAME session id is not a session
+        boundary: the marker recorded by finalize_session on shutdown is the
+        resume point, not a real boundary. bind_session has already restored
+        current_session_id to session_id; this clears the finalized marker
+        (last_finalized_session_id / last_finalized_frontier_store_id) and any
+        stale debt so downstream debt/finalize logic does not treat the live
+        resumed session as already-finalized backlog. The frontier is advanced
+        monotonically (MAX) in the same write so the resume is atomic.
+
+        Guarded on current_session_id == session_id so a genuine new-session
+        boundary (which leaves last_finalized pointing at the OLD session) is
+        never re-bound: the UPDATE simply no-ops and returns the current row.
+        """
+        if not conversation_id:
+            return None
+        state = self.get_by_conversation(conversation_id)
+        if state is None or state.current_session_id != session_id:
+            return state
+        now = time.time()
+        conn = self._conn
+        assert conn is not None
+        cursor = conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                last_finalized_session_id = NULL,
+                last_finalized_frontier_store_id = 0,
+                last_finalized_at = NULL,
+                debt_kind = NULL,
+                debt_size_estimate = 0,
+                debt_updated_at = NULL,
+                updated_at = ?
+            WHERE conversation_id = ? AND current_session_id = ?
+            """,
+            (int(frontier_store_id or 0), now, conversation_id, session_id),
+        )
+        if cursor.rowcount == 0:
+            return self.get_by_conversation(conversation_id)
+        conn.commit()
+        return self.get_by_conversation(conversation_id)

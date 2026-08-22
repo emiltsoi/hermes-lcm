@@ -3765,6 +3765,136 @@ class TestEngineABC:
         finally:
             after.shutdown()
 
+    def test_restart_resume_after_shutdown_finalize_rebinds_and_clears_finalized_marker(self, tmp_path):
+        # The discriminator: a restart/resume of the SAME session id must
+        # restore BOTH the current binding AND the frontier, AND clear the
+        # finalized marker (last_finalized_session_id /
+        # last_finalized_frontier_store_id) plus any stale debt. Leaving
+        # last_finalized_session_id == the live session makes the row look
+        # already-finalized, so the engine treats the 42K+ live raw messages
+        # as UNBOUND backlog and churns compress preflights/refusals.
+        db_path = tmp_path / "restart-resume-rebind.db"
+        config = LCMConfig(database_path=str(db_path))
+        before = LCMEngine(config=config)
+        try:
+            before.on_session_start(
+                "resume-session",
+                platform="cli",
+                conversation_id="resume-conversation",
+                context_length=200000,
+            )
+            before._ingest_messages([
+                {"role": "system", "content": "You are concise."},
+                {"role": "user", "content": "question before restart"},
+                {"role": "assistant", "content": "answer before restart"},
+            ])
+            frontier = before._store.get_session_count("resume-session")
+            assert frontier > 0
+            before._last_compacted_store_id = frontier
+            before._lifecycle.advance_frontier(
+                "resume-conversation",
+                "resume-session",
+                frontier,
+            )
+            # Simulate stale compression debt recorded before shutdown; it must
+            # be cleared on resume so it cannot re-trigger the churn loop.
+            before._lifecycle.record_debt(
+                "resume-conversation",
+                kind="raw_backlog",
+                size_estimate=250000,
+            )
+            # Gateway shutdown finalizes the currently-bound active session.
+            before.on_session_end("resume-session", [])
+            finalized = before._lifecycle.get_by_conversation("resume-conversation")
+            assert finalized is not None
+            assert finalized.current_session_id is None
+            assert finalized.last_finalized_session_id == "resume-session"
+            assert finalized.current_frontier_store_id == 0
+            assert finalized.last_finalized_frontier_store_id == frontier
+            assert finalized.debt_kind == "raw_backlog"
+        finally:
+            before.shutdown()
+
+        after = LCMEngine(config=config)
+        try:
+            after.on_session_start(
+                "resume-session",
+                platform="cli",
+                conversation_id="resume-conversation",
+                context_length=200000,
+            )
+            state = after._lifecycle.get_by_conversation("resume-conversation")
+            assert state is not None
+            # Resume of the SAME session id is not a boundary: the current
+            # binding AND the frontier must be restored from the finalized
+            # marker, not left at zero.
+            assert state.current_session_id == "resume-session"
+            assert state.current_frontier_store_id == frontier
+            assert after._last_compacted_store_id == frontier
+            # The finalized marker must be cleared so the row no longer looks
+            # already-finalized to downstream debt/finalize logic.
+            assert state.last_finalized_session_id is None
+            assert state.last_finalized_frontier_store_id == 0
+            assert state.last_finalized_at is None
+            # Stale shutdown debt must be cleared: this is the churn trigger.
+            assert state.debt_kind is None
+            assert state.debt_size_estimate == 0
+            assert not after._has_raw_backlog_debt()
+        finally:
+            after.shutdown()
+
+    def test_restart_resume_rebind_does_not_clear_finalized_marker_for_new_session(self, tmp_path):
+        # A REAL boundary (next session has a genuinely-new id) must keep the
+        # old session finalized: last_finalized_session_id stays pointing at
+        # the OLD id, the new session starts at frontier 0, and no rebind
+        # clears the old finalized marker.
+        db_path = tmp_path / "restart-boundary-rebind.db"
+        config = LCMConfig(database_path=str(db_path))
+        before = LCMEngine(config=config)
+        try:
+            before.on_session_start(
+                "boundary-old",
+                platform="cli",
+                conversation_id="boundary-conversation",
+                context_length=200000,
+            )
+            before._ingest_messages([
+                {"role": "system", "content": "You are concise."},
+                {"role": "user", "content": "question before boundary"},
+                {"role": "assistant", "content": "answer before boundary"},
+            ])
+            frontier = before._store.get_session_count("boundary-old")
+            before._last_compacted_store_id = frontier
+            before._lifecycle.advance_frontier(
+                "boundary-conversation",
+                "boundary-old",
+                frontier,
+            )
+            before.on_session_end("boundary-old", [])
+        finally:
+            before.shutdown()
+
+        after = LCMEngine(config=config)
+        try:
+            after.on_session_start(
+                "boundary-new",
+                platform="cli",
+                conversation_id="boundary-conversation",
+                context_length=200000,
+            )
+            old_state = after._lifecycle.get_by_conversation("boundary-conversation")
+            assert old_state is not None
+            assert old_state.current_session_id == "boundary-new"
+            # The old session stays finalized; the marker is NOT cleared because
+            # last_finalized_session_id != the session being bound.
+            assert old_state.last_finalized_session_id == "boundary-old"
+            assert old_state.last_finalized_frontier_store_id == frontier
+            # The new session starts with a zeroed active frontier.
+            assert old_state.current_frontier_store_id == 0
+            assert after._last_compacted_store_id == 0
+        finally:
+            after.shutdown()
+
     def test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool(self, tmp_path):
         db_path = tmp_path / "restart-compacted.db"
         config = LCMConfig(database_path=str(db_path))
