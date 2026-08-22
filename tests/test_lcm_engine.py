@@ -3658,6 +3658,113 @@ class TestEngineABC:
         assert rows[-1]["tool_call_id"] == "call_1"
         assert after_restart._ingest_cursor == len(active_context)
 
+    def test_restart_resume_after_shutdown_finalize_restores_frontier(self, tmp_path):
+        # A gateway restart is not a session boundary: the next process resumes
+        # the SAME session id. If the prior process finalized the currently-bound
+        # active session on shutdown (zeroing the persisted frontier), the resumed
+        # engine must restore the frontier from the finalized marker instead of
+        # treating every existing raw message as new compression debt.
+        db_path = tmp_path / "restart-resume-finalize.db"
+        config = LCMConfig(database_path=str(db_path))
+        before = LCMEngine(config=config)
+        try:
+            before.on_session_start(
+                "resume-session",
+                platform="cli",
+                conversation_id="resume-conversation",
+                context_length=200000,
+            )
+            before._ingest_messages([
+                {"role": "system", "content": "You are concise."},
+                {"role": "user", "content": "question before restart"},
+                {"role": "assistant", "content": "answer before restart"},
+            ])
+            frontier = before._store.get_session_count("resume-session")
+            assert frontier > 0
+            before._last_compacted_store_id = frontier
+            before._lifecycle.advance_frontier(
+                "resume-conversation",
+                "resume-session",
+                frontier,
+            )
+            # Gateway shutdown finalizes the currently-bound active session.
+            before.on_session_end("resume-session", [])
+            finalized = before._lifecycle.get_by_conversation("resume-conversation")
+            assert finalized is not None
+            assert finalized.current_session_id is None
+            assert finalized.last_finalized_session_id == "resume-session"
+            assert finalized.current_frontier_store_id == 0
+            assert finalized.last_finalized_frontier_store_id == frontier
+        finally:
+            before.shutdown()
+
+        after = LCMEngine(config=config)
+        try:
+            after.on_session_start(
+                "resume-session",
+                platform="cli",
+                conversation_id="resume-conversation",
+                context_length=200000,
+            )
+            state = after._lifecycle.get_by_conversation("resume-conversation")
+            assert state is not None
+            # Resume of the SAME session id is not a boundary: the frontier must
+            # be restored from the finalized marker, not left at zero.
+            assert state.current_session_id == "resume-session"
+            assert state.current_frontier_store_id == frontier
+            assert after._last_compacted_store_id == frontier
+            assert not after._has_raw_backlog_debt()
+        finally:
+            after.shutdown()
+
+    def test_restart_resume_after_shutdown_finalize_does_not_restore_for_new_session(self, tmp_path):
+        # A REAL boundary (next session has a genuinely-new id) must still
+        # finalize the old session and leave the new session's frontier at zero.
+        db_path = tmp_path / "restart-boundary-finalize.db"
+        config = LCMConfig(database_path=str(db_path))
+        before = LCMEngine(config=config)
+        try:
+            before.on_session_start(
+                "boundary-old",
+                platform="cli",
+                conversation_id="boundary-conversation",
+                context_length=200000,
+            )
+            before._ingest_messages([
+                {"role": "system", "content": "You are concise."},
+                {"role": "user", "content": "question before boundary"},
+                {"role": "assistant", "content": "answer before boundary"},
+            ])
+            frontier = before._store.get_session_count("boundary-old")
+            before._last_compacted_store_id = frontier
+            before._lifecycle.advance_frontier(
+                "boundary-conversation",
+                "boundary-old",
+                frontier,
+            )
+            before.on_session_end("boundary-old", [])
+        finally:
+            before.shutdown()
+
+        after = LCMEngine(config=config)
+        try:
+            after.on_session_start(
+                "boundary-new",
+                platform="cli",
+                conversation_id="boundary-conversation",
+                context_length=200000,
+            )
+            old_state = after._lifecycle.get_by_conversation("boundary-conversation")
+            assert old_state is not None
+            assert old_state.current_session_id == "boundary-new"
+            assert old_state.last_finalized_session_id == "boundary-old"
+            assert old_state.last_finalized_frontier_store_id == frontier
+            # The new session starts with a zeroed active frontier.
+            assert old_state.current_frontier_store_id == 0
+            assert after._last_compacted_store_id == 0
+        finally:
+            after.shutdown()
+
     def test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool(self, tmp_path):
         db_path = tmp_path / "restart-compacted.db"
         config = LCMConfig(database_path=str(db_path))

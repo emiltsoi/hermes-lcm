@@ -1707,10 +1707,43 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         conversation_id: str | None = None,
     ) -> None:
+        # Gateway restart/resume discriminator: capture the pre-bind lifecycle
+        # row so we can tell a resume of a finalized session apart from a real
+        # session boundary. A shutdown may have finalized the currently-bound
+        # active session (zeroing the persisted frontier); resuming the SAME
+        # session id is not a boundary, so the frontier must be restored below.
+        prior_state = (
+            self._lifecycle.get_by_conversation(conversation_id)
+            if conversation_id
+            else self._lifecycle.get_by_session(session_id)
+        )
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id
         self._last_compacted_store_id = state.current_frontier_store_id
+        if (
+            prior_state is not None
+            and prior_state.current_session_id is None
+            and prior_state.last_finalized_session_id == session_id
+            and int(prior_state.last_finalized_frontier_store_id or 0) > 0
+            and int(state.current_frontier_store_id or 0)
+            < int(prior_state.last_finalized_frontier_store_id or 0)
+        ):
+            # The next process is binding the SAME session id that the prior
+            # process finalized on shutdown — a restart/resume, not a boundary.
+            # bind_session zeroed the frontier because the row was finalized;
+            # restore it from the finalized marker so raw rows at or below it
+            # are not reclassified as new compression debt on the resumed run.
+            restored = self._lifecycle.advance_frontier(
+                state.conversation_id,
+                session_id,
+                int(prior_state.last_finalized_frontier_store_id),
+            )
+            if restored is not None and int(restored.current_frontier_store_id) > int(
+                state.current_frontier_store_id
+            ):
+                state = restored
+                self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
