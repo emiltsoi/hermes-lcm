@@ -929,6 +929,70 @@ class LifecycleStateStore:
         return self.get_by_conversation(conversation_id)
 
     @_synchronized
+    def resume_stale_marker_session(
+        self,
+        conversation_id: str | None,
+        session_id: str,
+        frontier_store_id: int,
+    ) -> LifecycleState | None:
+        """Clear a stale finalized marker that points at the LIVE session.
+
+        Third resume arm (case (c)): a prior ``finalize_session`` was called
+        with ``frontier_store_id=0`` (partial/finalize-and-forget, or after the
+        frontier was already zeroed), writing ``current=None``,
+        ``last_finalized=<S>``, ``frontier=0``, ``last_finalized_frontier=0``.
+        A subsequent ``bind_session(<S>)`` set ``current=<S>`` but did NOT clear
+        ``last_finalized`` (the marker stayed). The result is a row where the
+        marker points at the LIVE session itself (``current == last_finalized``
+        == ``<S>``) with both frontiers at 0 — stale by construction. The
+        marker arm misses it (``last_finalized_frontier == 0``) and the
+        no-marker arm misses it (``last_finalized`` is not NULL).
+
+        This is a resume of the SAME session id, not a boundary: restore
+        ``current_frontier_store_id`` to the session's real content boundary
+        (``MAX(store_id)`` -- everything already in the DB is known content, no
+        debt) AND clear the stale finalized marker
+        (``last_finalized_session_id`` / ``last_finalized_frontier_store_id`` /
+        ``last_finalized_at``) and any stale debt, so downstream debt/finalize
+        logic does not treat the live resumed session as already-finalized
+        backlog. Unlike :meth:`resume_orphaned_session` (no-marker case) the
+        finalized columns MUST be cleared here because the stale marker exists.
+
+        Guarded on ``current_session_id == session_id`` so a genuine new-session
+        boundary (which leaves ``last_finalized`` pointing at the OLD session)
+        is never touched: the UPDATE no-ops and returns the row. A real boundary
+        marker (``last_finalized`` != ``current``) is left untouched because the
+        caller only invokes this arm when ``current == last_finalized``.
+        """
+        if not conversation_id:
+            return None
+        state = self.get_by_conversation(conversation_id)
+        if state is None or state.current_session_id != session_id:
+            return state
+        now = time.time()
+        conn = self._conn
+        assert conn is not None
+        cursor = conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                last_finalized_session_id = NULL,
+                last_finalized_frontier_store_id = 0,
+                last_finalized_at = NULL,
+                debt_kind = NULL,
+                debt_size_estimate = 0,
+                debt_updated_at = NULL,
+                updated_at = ?
+            WHERE conversation_id = ? AND current_session_id = ?
+            """,
+            (int(frontier_store_id or 0), now, conversation_id, session_id),
+        )
+        if cursor.rowcount == 0:
+            return self.get_by_conversation(conversation_id)
+        conn.commit()
+        return self.get_by_conversation(conversation_id)
+
+    @_synchronized
     def get_session_max_store_id(self, session_id: str) -> int:
         """Return ``MAX(store_id)`` for a session from the messages table, or 0.
 

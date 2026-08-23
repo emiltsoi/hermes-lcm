@@ -1780,6 +1780,49 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ):
                     state = restored
                     self._last_compacted_store_id = state.current_frontier_store_id
+        elif (
+            prior_state is not None
+            and prior_state.current_session_id is not None
+            and prior_state.last_finalized_session_id is not None
+            and prior_state.last_finalized_session_id
+            == prior_state.current_session_id
+            and int(state.current_frontier_store_id or 0) == 0
+        ):
+            # Stale-marker resume arm (case (c)): a prior finalize_session was
+            # called with frontier_store_id=0 (partial/finalize-and-forget, or
+            # after the frontier was already zeroed), writing current=None,
+            # last_finalized=<S>, frontier=0, last_finalized_frontier=0. A
+            # subsequent bind_session(<S>) set current=<S> but did NOT clear
+            # last_finalized, so the marker now points at the LIVE session
+            # itself (current == last_finalized == <S>) with both frontiers at
+            # 0 — stale by construction. The marker arm misses it
+            # (last_finalized_frontier == 0) and the no-marker arm misses it
+            # (last_finalized is not NULL). bind_session early-returned because
+            # current == session_id, so the frontier stayed at 0.
+            #
+            # This is a resume of the SAME session id, not a boundary: if the
+            # session has live messages, restore the frontier to MAX(store_id)
+            # (the real content boundary — everything already in the DB is known
+            # content, no debt) AND clear the stale finalized marker + any stale
+            # debt, so downstream logic does not treat the live resumed session
+            # as already-finalized backlog. A session with no rows (MAX == 0)
+            # has nothing to restore: leave the row as-is (the marker stays but
+            # there is no backlog to misclassify). A real boundary marker
+            # (last_finalized points at the OLD session, != current) does NOT
+            # fire here because the discriminator requires current ==
+            # last_finalized.
+            max_store_id = self._lifecycle.get_session_max_store_id(session_id)
+            if max_store_id > 0:
+                restored = self._lifecycle.resume_stale_marker_session(
+                    state.conversation_id,
+                    session_id,
+                    max_store_id,
+                )
+                if restored is not None and int(restored.current_frontier_store_id) > int(
+                    state.current_frontier_store_id
+                ):
+                    state = restored
+                    self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
