@@ -927,3 +927,74 @@ class LifecycleStateStore:
             return self.get_by_conversation(conversation_id)
         conn.commit()
         return self.get_by_conversation(conversation_id)
+
+    @_synchronized
+    def get_session_max_store_id(self, session_id: str) -> int:
+        """Return ``MAX(store_id)`` for a session from the messages table, or 0.
+
+        The lifecycle and messages tables share the same SQLite database file,
+        so this connection can read the content boundary for a session directly.
+        Used by the no-marker resume arm in ``_bind_lifecycle_state`` to detect
+        whether a session has live messages and to restore its real content
+        frontier when the shutdown finalize was skipped (no finalized marker).
+        A session with no rows returns 0, which the caller treats as a genuine
+        new session and leaves at frontier 0.
+        """
+        conn = self._conn
+        assert conn is not None
+        row = conn.execute(
+            "SELECT MAX(store_id) FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return 0
+        val = row[0]
+        return int(val) if val is not None else 0
+
+    @_synchronized
+    def resume_orphaned_session(
+        self,
+        conversation_id: str | None,
+        session_id: str,
+        frontier_store_id: int,
+    ) -> LifecycleState | None:
+        """Restore the frontier for a resumed session with NO finalized marker.
+
+        Sibling of :meth:`resume_finalized_session` for the skip-finalize case:
+        the shutdown finalize was skipped (guard or SQLite lock), so
+        ``last_finalized_session_id`` was never written. ``bind_session`` saw
+        ``current=None`` + ``last_finalized=NULL`` and zeroed the frontier. The
+        session has live messages, so this is a resume of an existing session,
+        not a new session: restore ``current_frontier_store_id`` to the
+        session's real content boundary (``MAX(store_id)`` -- everything already
+        in the DB is known content, no debt) and clear any stale debt. Unlike
+        ``resume_finalized_session`` there is no marker to clear, so the
+        finalized columns are left untouched (already NULL/0).
+
+        Guarded on ``current_session_id == session_id`` so a genuine new-session
+        boundary is never touched: the UPDATE no-ops and returns the row.
+        """
+        if not conversation_id:
+            return None
+        state = self.get_by_conversation(conversation_id)
+        if state is None or state.current_session_id != session_id:
+            return state
+        now = time.time()
+        conn = self._conn
+        assert conn is not None
+        cursor = conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                debt_kind = NULL,
+                debt_size_estimate = 0,
+                debt_updated_at = NULL,
+                updated_at = ?
+            WHERE conversation_id = ? AND current_session_id = ?
+            """,
+            (int(frontier_store_id or 0), now, conversation_id, session_id),
+        )
+        if cursor.rowcount == 0:
+            return self.get_by_conversation(conversation_id)
+        conn.commit()
+        return self.get_by_conversation(conversation_id)

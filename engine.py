@@ -1751,6 +1751,35 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ):
                 state = restored
                 self._last_compacted_store_id = state.current_frontier_store_id
+        elif (
+            prior_state is not None
+            and prior_state.current_session_id is None
+            and prior_state.last_finalized_session_id is None
+            and int(state.current_frontier_store_id or 0) == 0
+        ):
+            # No-marker resume arm: the shutdown finalize was SKIPPED (the
+            # session-end guard, or a SQLite lock), so last_finalized_session_id
+            # was NEVER written. bind_session saw current=None +
+            # last_finalized=NULL and zeroed the frontier. If the binding
+            # session has live messages, this is a resume of an existing
+            # session, not a new session: restore the frontier to the session's
+            # real content boundary (MAX(store_id) -- everything already in the
+            # DB is known content, so there is no compression debt). A genuinely
+            # new session (0 messages) stays at frontier 0. A real boundary
+            # (last_finalized points at the OLD id) is left untouched because
+            # the marker is not NULL.
+            max_store_id = self._lifecycle.get_session_max_store_id(session_id)
+            if max_store_id > 0:
+                restored = self._lifecycle.resume_orphaned_session(
+                    state.conversation_id,
+                    session_id,
+                    max_store_id,
+                )
+                if restored is not None and int(restored.current_frontier_store_id) > int(
+                    state.current_frontier_store_id
+                ):
+                    state = restored
+                    self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
