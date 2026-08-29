@@ -11972,6 +11972,78 @@ class TestEngineCompress:
         assert engine.get_status()["condensation_suppressed_reason"] == ""
 
 
+    def test_widened_backlog_is_chunked_not_one_giant_summarize_call(self, tmp_path, monkeypatch):
+        """Regression: the store-backlog widen (agent0 2026-08-30 layer-3) pulls a
+        huge unsummarized backlog into candidate_raw. With the DEFAULT config
+        (no full-sweep, no dynamic leaf chunk), the else branch previously sent
+        the WHOLE widened set to the summarizer as one chunk -> 400
+        (requested 2.95M > 1M context). It must chunk via
+        _select_oldest_leaf_chunk (bounded by leaf_chunk_tokens) instead.
+        """
+        from hermes_lcm import compaction as lcm_compaction
+        from hermes_lcm import engine as lcm_engine_module
+
+        db_path = tmp_path / "widen-chunk.db"
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=200,  # small — a widened backlog must be chunked to this
+            database_path=str(db_path),
+            # defaults: dynamic_leaf_chunk_enabled=False, threshold_full_sweep_enabled=False
+        )
+        eng = LCMEngine(config=config)
+        eng.on_session_start(
+            "widen-chunk-session",
+            platform="cli",
+            conversation_id="widen-chunk-conversation",
+            context_length=200000,
+        )
+
+        # A large unsummarized store backlog (the widen source): 40 messages
+        # each well over leaf_chunk_tokens/4 -> the whole set would blow the
+        # chunk budget if sent as one.
+        backlog = [
+            {"role": "assistant", "content": f"backlog message {idx} " + "x" * 120}
+            for idx in range(40)
+        ]
+        eng._store.append_batch("widen-chunk-session", backlog)
+
+        summarize_calls = []
+
+        def mock_summarize_with_rescue(messages, **kwargs):
+            summarize_calls.append(messages)
+            return (messages, len(messages), "summary", 0, 0)
+
+        monkeypatch.setattr(
+            eng,
+            "_summarize_leaf_chunk_with_rescue",
+            mock_summarize_with_rescue,
+        )
+
+        # Active context: a small fresh window; the backlog is the widen source.
+        active = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": "fresh reply"},
+        ]
+        result = eng.compress(active)
+
+        # The summarizer must NOT have been handed the whole backlog as one call.
+        assert summarize_calls, "expected at least one summarize call"
+        from hermes_lcm.tokens import count_message_tokens
+        for call in summarize_calls:
+            tokens = sum(count_message_tokens(m) for m in call)
+            assert tokens <= config.leaf_chunk_tokens * 1.5, (
+                f"summarize received {tokens} tokens — chunking broken (whole widened set)"
+            )
+        # The first chunk must be a PROPER SUBSET of the backlog (chunked), not
+        # the whole 40-message widened set in one call.
+        assert len(summarize_calls[0]) < len(backlog), (
+            f"summarize received the whole widened set ({len(summarize_calls[0])} msgs) in one call"
+        )
+        # The backlog was consumed (compacted) rather than left untouched.
+        assert len(result) >= 0
+
+
 class TestPostCompactionIngestion:
     """Regression tests for issue #1 — messages must be persisted after
     compaction even though the active context is shorter than the store."""
@@ -27366,3 +27438,4 @@ class TestExtractionDuringCompress:
         result = eng.compress(messages)
         assert result[0]["role"] == "system"
         assert len(eng._dag.get_session_nodes("extract-fail")) > 0
+

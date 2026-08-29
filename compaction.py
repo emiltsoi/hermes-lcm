@@ -427,6 +427,7 @@ class CompactionMixin:
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
+        self._working_set_widened = False
         # SCOPE FIX (2026-08-29, fleet-wide leaf no-op): the host passes only
         # the CURRENT context window (e.g. ~1,134 msgs) to compress(), not the
         # session store. When the store holds a large unsummarized backlog
@@ -460,6 +461,7 @@ class CompactionMixin:
                 )
                 if len(stored) > len(working_messages):
                     working_messages = stored
+                    self._working_set_widened = True
                     logger.info(
                         "compress: widened working set from window (%d) to "
                         "store backlog (%d after compacted boundary %d) — "
@@ -731,7 +733,21 @@ class CompactionMixin:
                             "raw backlog outside fresh tail is below leaf chunk threshold"
                         )
                         break
-                to_compact = candidate_raw
+                # Widened working set: the store-backlog widen (see above) can
+                # pull a huge unsummarized backlog into candidate_raw. Sending
+                # the WHOLE candidate to the summarizer as one chunk overflows
+                # the model context (400: requested > max context). Chunk it
+                # like the dynamic/full-sweep paths — bounded leaf chunk, then
+                # the leaf-pass loop consumes the rest in subsequent passes.
+                # Only chunk when the candidate EXCEEDS one chunk (the widen
+                # case); a candidate that fits in one chunk keeps the old
+                # whole-candidate behavior (preservation tests depend on it).
+                if force_overflow or not getattr(self, "_working_set_widened", False):
+                    to_compact = candidate_raw
+                else:
+                    to_compact = self._select_oldest_leaf_chunk(
+                        candidate_raw, self._config.leaf_chunk_tokens
+                    )
 
             if not to_compact:
                 noop_reason = "no eligible leaf chunk selected"
