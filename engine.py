@@ -1521,6 +1521,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     conversation_id=self._conversation_id,
                 )
                 self._ingest_messages(messages)
+                # Frontier must advance WITH ingest, not only on compaction.
+                # advance_frontier is otherwise called only at bind + after a
+                # compaction; when the preflight is gated off (or no compaction
+                # fires), the lifecycle frontier stays frozen while MAX(store_id)
+                # grows -> the engine computes 0 raw backlog -> no debt -> no
+                # deferred maintenance -> context runs hot (fleet-wide frozen
+                # frontier incident 2026-08-29, Zero's scan: daji 283K lag etc).
+                # advance_frontier uses MAX() in SQL so this stays monotonic;
+                # the conversation-level max keeps the checkpoint honest.
+                if self._conversation_id:
+                    self._lifecycle.advance_frontier_to_store_max(
+                        self._conversation_id,
+                        self._session_id,
+                    )
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(

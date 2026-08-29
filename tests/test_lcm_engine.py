@@ -3658,6 +3658,51 @@ class TestEngineABC:
         assert rows[-1]["tool_call_id"] == "call_1"
         assert after_restart._ingest_cursor == len(active_context)
 
+    def test_ingest_advances_frontier_to_store_max_without_compaction(self, tmp_path):
+        # Fleet-wide frozen-frontier incident (2026-08-29): the lifecycle
+        # frontier was only advanced at bind + after a compaction. When the
+        # preflight is gated off (agent.compression.enabled: false) or no
+        # compaction fires, the frontier stayed frozen while MAX(store_id)
+        # grew -> 0 raw backlog -> no debt -> no maintenance -> hot context.
+        # Per-turn ingest() must advance the frontier to the store max.
+        config = LCMConfig(database_path=tmp_path / "lcm.db")
+        engine = LCMEngine(config=config, hermes_home=tmp_path)
+        try:
+            engine.on_session_start(
+                "ingest-session",
+                platform="cli",
+                conversation_id="ingest-conversation",
+                context_length=200000,
+            )
+            state = engine._lifecycle.get_by_conversation("ingest-conversation")
+            assert state is not None
+            assert state.current_frontier_store_id == 0
+
+            # ingest messages (no compaction fires)
+            engine.ingest([
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+            ])
+
+            # frontier must now equal the store max (the messages were stored)
+            state = engine._lifecycle.get_by_conversation("ingest-conversation")
+            store_max = engine._store.get_session_messages("ingest-session")
+            max_id = max(row["store_id"] for row in store_max)
+            assert state.current_frontier_store_id == max_id, (
+                f"frontier {state.current_frontier_store_id} != store max {max_id}"
+            )
+
+            # a second ingest advances it further (monotonic)
+            engine.ingest([
+                {"role": "user", "content": "third"},
+            ])
+            state = engine._lifecycle.get_by_conversation("ingest-conversation")
+            store_max = engine._store.get_session_messages("ingest-session")
+            max_id = max(row["store_id"] for row in store_max)
+            assert state.current_frontier_store_id == max_id
+        finally:
+            engine.shutdown()
+
     def test_restart_resume_after_shutdown_finalize_restores_frontier(self, tmp_path):
         # A gateway restart is not a session boundary: the next process resumes
         # the SAME session id. If the prior process finalized the currently-bound

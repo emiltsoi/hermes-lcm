@@ -879,6 +879,49 @@ class LifecycleStateStore:
             return self.get_by_conversation(conversation_id)
 
     @_synchronized
+    def advance_frontier_to_store_max(
+        self,
+        conversation_id: str,
+        session_id: str,
+    ) -> LifecycleState | None:
+        """Advance the lifecycle frontier to the store's MAX(store_id).
+
+        Called from per-turn ingest() so the raw-backlog/debt computation
+        stays honest even when no compaction fires (the frozen-frontier
+        incident class: frontier was only advanced at bind + after compaction,
+        so a gated-off preflight left it stuck while messages kept storing).
+        The UPDATE is guarded on current_session_id == session_id and uses
+        MAX() in SQL so it stays monotonic under concurrency.
+        """
+        if not conversation_id:
+            return None
+        state = self.get_by_conversation(conversation_id)
+        if state is None or state.current_session_id != session_id:
+            return state
+        now = time.time()
+        conn = self._conn
+        assert conn is not None
+        cursor = conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET current_frontier_store_id = MAX(
+                    current_frontier_store_id,
+                    COALESCE(
+                        (SELECT MAX(store_id) FROM messages WHERE conversation_id = ?),
+                        0
+                    )
+                ),
+                updated_at = ?
+            WHERE conversation_id = ? AND current_session_id = ?
+            """,
+            (conversation_id, now, conversation_id, session_id),
+        )
+        if cursor.rowcount == 0:
+            return self.get_by_conversation(conversation_id)
+        conn.commit()
+        return self.get_by_conversation(conversation_id)
+
+    @_synchronized
     def resume_finalized_session(
         self,
         conversation_id: str | None,
