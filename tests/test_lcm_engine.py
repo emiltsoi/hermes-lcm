@@ -12218,8 +12218,6 @@ class TestEngineCompress:
         (requested 2.95M > 1M context). It must chunk via
         _select_oldest_leaf_chunk (bounded by leaf_chunk_tokens) instead.
         """
-        from hermes_lcm import compaction as lcm_compaction
-        from hermes_lcm import engine as lcm_engine_module
 
         db_path = tmp_path / "widen-chunk.db"
         config = LCMConfig(
@@ -12295,7 +12293,6 @@ class TestPostCompactionIngestion:
         or leaf_chunk_tokens) instead of draining the whole backlog into a
         growing context.
         """
-        from hermes_lcm import engine as lcm_engine_module
 
         db_path = tmp_path / "widen-budget.db"
         config = LCMConfig(
