@@ -12286,6 +12286,73 @@ class TestPostCompactionIngestion:
     """Regression tests for issue #1 — messages must be persisted after
     compaction even though the active context is shorter than the store."""
 
+    def test_widened_backlog_total_summary_is_budgeted_not_growing(self, tmp_path, monkeypatch):
+        """Regression (agent0 2026-08-30 edge): the widened leaf path can GROW
+        the context — a large backlog split into many chunks produces per-chunk
+        summaries that MERGE into a total larger than the window (2,891 msgs ->
+        736K-token summary > 389K window). The leaf loop must stop at a
+        total-summary budget (widened_summary_budget = summary_prefix_target_tokens
+        or leaf_chunk_tokens) instead of draining the whole backlog into a
+        growing context.
+        """
+        from hermes_lcm import engine as lcm_engine_module
+
+        db_path = tmp_path / "widen-budget.db"
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=200,      # small — many chunks
+            database_path=str(db_path),
+        )
+        eng = LCMEngine(config=config)
+        eng.on_session_start(
+            "widen-budget-session",
+            platform="cli",
+            conversation_id="widen-budget-conversation",
+            context_length=200000,
+        )
+
+        # A large backlog: 40 messages, each well over leaf_chunk_tokens/4.
+        backlog = [
+            {"role": "assistant", "content": f"backlog {idx} " + "x" * 120}
+            for idx in range(40)
+        ]
+        eng._store.append_batch("widen-budget-session", backlog)
+
+        summarize_calls = []
+
+        def mock_summarize_with_rescue(messages, **kwargs):
+            summarize_calls.append(messages)
+            # A LARGE summary (bigger than the source chunk) — the growth edge:
+            # the merged total would exceed the budget.
+            big = "s" * 300
+            return (messages, len(messages), big, 0, 0)
+
+        monkeypatch.setattr(
+            eng,
+            "_summarize_leaf_chunk_with_rescue",
+            mock_summarize_with_rescue,
+        )
+
+        active = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": "fresh reply"},
+        ]
+        result = eng.compress(active)
+
+        # The leaf loop must NOT have drained the whole backlog: the summary
+        # budget (leaf_chunk_tokens=200) caps the total summary output, so the
+        # number of summarize calls is bounded (not 40 messages / chunk size).
+        # Each mock summary is 300 chars ≈ 75 tokens; budget 200 → at most
+        # ~3 calls before the cap.
+        assert len(summarize_calls) <= 4, (
+            f"leaf loop drained the whole backlog ({len(summarize_calls)} calls) "
+            f"— total-summary budget missing"
+        )
+        # The context did NOT grow unbounded: the result is shorter than the
+        # full backlog would have been (some backlog left for future passes).
+        assert len(result) < len(backlog), "backlog fully drained despite budget"
+
     def _make_long_conversation(self, n_turns=20):
         messages = [{"role": "system", "content": "You are a helpful assistant."}]
         for i in range(n_turns):

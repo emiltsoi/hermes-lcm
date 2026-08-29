@@ -504,6 +504,19 @@ class CompactionMixin:
         leaf_compacted_this_turn = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
+        # Total-summary-output bound for the WIDENED leaf path (agent0 2026-08-30
+        # edge): with a large store backlog split into many chunks, per-chunk
+        # summaries (12K cap each) can MERGE into a total LARGER than the
+        # original window -> the anti-growth guard refuses (double work + cache
+        # break). Cap the accumulated summary tokens so a widened drain stops
+        # once the summary prefix would exceed the budget; the rest of the
+        # backlog waits for future compactions.
+        widened_summary_budget = (
+            int(self._config.summary_prefix_target_tokens)
+            if self._config.summary_prefix_target_tokens > 0
+            else int(self._config.leaf_chunk_tokens)
+        )
+        widened_summary_used = 0
         estimated_active_tokens = (
             observed_prompt_tokens
             if observed_prompt_tokens is not None and observed_prompt_tokens > 0
@@ -862,6 +875,16 @@ class CompactionMixin:
             leaf_compacted_this_turn = True
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
+            if getattr(self, "_working_set_widened", False):
+                widened_summary_used += summary_tokens
+                if widened_summary_used >= widened_summary_budget:
+                    logger.info(
+                        "compress: widened leaf drain hit total-summary budget "
+                        "(%d >= %d tokens) — leaving the rest of the backlog for "
+                        "future compactions",
+                        widened_summary_used, widened_summary_budget,
+                    )
+                    break
 
             if threshold_full_sweep_active:
                 leading_anchor_count = self._leading_anchor_count(working_messages)
