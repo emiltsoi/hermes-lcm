@@ -5071,7 +5071,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             content = sanitize_pre_compaction_content(content)
 
             if role == "assistant":
-                tool_calls = msg.get("tool_calls", [])
+                tool_calls = msg.get("tool_calls") or []
                 matched_tool_calls = [
                     tc for tc in tool_calls
                     if not _tool_call_id(tc) or _tool_call_id(tc) in matched_tool_ids

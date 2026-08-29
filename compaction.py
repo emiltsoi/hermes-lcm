@@ -427,6 +427,47 @@ class CompactionMixin:
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
+        # SCOPE FIX (2026-08-29, fleet-wide leaf no-op): the host passes only
+        # the CURRENT context window (e.g. ~1,134 msgs) to compress(), not the
+        # session store. When the store holds a large unsummarized backlog
+        # (the 31K-message class — debt detection now fires after the
+        # ingest-advance fix), the leaf pass must see the STORE's messages, or
+        # it no-ops ("1134->1134") because everything in the window is already
+        # fresh-tail/summarized. Assemble the working set from the canonical
+        # store when the window is materially smaller than the session.
+        if self._session_id:
+            try:
+                # Pull the UNCOMPACTED store backlog — messages AFTER the
+                # highest store_id already covered by a DAG summary node.
+                # Do NOT key on the lifecycle frontier (it advances with
+                # ingest now, so it no longer marks "compacted" state) and do
+                # NOT pull the whole session (already-summarized rows must not
+                # re-enter the working set — re-anchoring class:
+                # test_compress_does_not_reanchor_preserved_user_request_*).
+                compacted_boundary = 0
+                try:
+                    from .tools import _inspect_highest_compacted_source_store_id
+                    compacted_boundary = int(
+                        _inspect_highest_compacted_source_store_id(
+                            self, self._session_id
+                        ) or 0
+                    )
+                except Exception:
+                    compacted_boundary = 0
+                stored = self._store.get_session_messages_after(
+                    self._session_id,
+                    after_store_id=compacted_boundary,
+                )
+                if len(stored) > len(working_messages):
+                    working_messages = stored
+                    logger.info(
+                        "compress: widened working set from window (%d) to "
+                        "store backlog (%d after compacted boundary %d) — "
+                        "backlog now visible to the leaf pass",
+                        len(messages), len(stored), compacted_boundary,
+                    )
+            except Exception as _store_err:
+                logger.warning("compress: store widen failed (%s); using window", _store_err)
         ingest_cleanup_changed_active_context = working_messages != messages
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown

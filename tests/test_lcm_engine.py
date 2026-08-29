@@ -10398,6 +10398,48 @@ class TestEngineCompress:
         assert status["last_compression_status"] == "noop"
         assert "eligible raw backlog" in status["last_compression_noop_reason"]
 
+    def test_compress_widens_working_set_from_store_when_window_is_small(self, engine, tmp_path):
+        """Fleet-wide leaf no-op class (2026-08-29): the host passes only the
+        current context window to compress(); if the STORE holds a large
+        unsummarized backlog, the leaf pass must widen its working set from
+        the store — otherwise it no-ops on a window whose content is already
+        fresh-tail/summarized while the real backlog stays invisible.
+        """
+        # Simulate the host passing a SMALL window while the store holds a
+        # large session (the vera class: ~31K stored, ~1.1K window).
+        small_window = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "recent question"},
+            {"role": "assistant", "content": "recent answer"},
+        ]
+        # Ingest a LARGE backlog directly into the store so the session is
+        # materially bigger than the window.
+        big_backlog = [
+            msg
+            for i in range(30)
+            for msg in (
+                {"role": "user", "content": f"old message {i} with enough tokens to compact"},
+                {"role": "assistant", "content": f"old answer {i} with enough tokens to compact"},
+            )
+        ]
+        engine.on_session_start(
+            "widening-session",
+            platform="cli",
+            conversation_id="widening-conversation",
+            context_length=200000,
+        )
+        engine.ingest(big_backlog)
+
+        # Now compress with only the small window. The working set must widen
+        # from the store (the backlog is visible) and the leaf pass must NOT
+        # report the "no eligible raw backlog" noop.
+        result = engine.compress(small_window)
+        assert engine._last_compression_status != "noop"
+        assert "no eligible raw backlog" not in engine._last_compression_noop_reason
+        assert len(result) < len(big_backlog) or engine._last_compression_status in (
+            "compacted", "condensed", "completed",
+        )
+
     def test_compress_short_conversation_sanitized_content_is_not_noop(self, engine):
         """Content-only active-context cleanup should report sanitized, not noop."""
         messages = [
