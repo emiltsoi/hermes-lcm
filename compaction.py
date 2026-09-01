@@ -895,6 +895,32 @@ class CompactionMixin:
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
             pressure_messages = pressure_messages[:leading_anchor_count] + pressure_remaining_messages
+            # INSERT THE SUMMARY into the working set (2026-09-01, Clara stall
+            # fix #3): the widened path returns the RAW sanitized context, NOT
+            # the DAG-pulling assembly — so the removed source MUST be replaced
+            # by the summary message here, or the output still carries the full
+            # source (the 1.2M-echo repro: output grew instead of shrinking).
+            # The summary becomes a synthetic assistant message at the source's
+            # position (leading anchor + compacted span + remaining fresh tail).
+            # GATED to the widened path only: the non-widened paths return via
+            # the DAG-pulling assembly, which already inserts summaries — a
+            # second insertion there would double-count (3 test failures).
+            if summary_text and getattr(self, "_working_set_widened", False):
+                summary_message = {
+                    "role": "assistant",
+                    "content": summary_text,
+                    "lcm_summary": True,
+                }
+                working_messages = (
+                    working_messages[:leading_anchor_count]
+                    + [summary_message]
+                    + working_messages[leading_anchor_count:]
+                )
+                pressure_messages = (
+                    pressure_messages[:leading_anchor_count]
+                    + [summary_message]
+                    + pressure_messages[leading_anchor_count:]
+                )
             leaf_compacted_this_turn = True
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)

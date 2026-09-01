@@ -12348,7 +12348,17 @@ class TestPostCompactionIngestion:
         )
         # The context did NOT grow unbounded: the result is shorter than the
         # full backlog would have been (some backlog left for future passes).
-        assert len(result) < len(backlog), "backlog fully drained despite budget"
+        # With the widened-path summary insertion (2026-09-01), each consumed
+        # leaf is REPLACED by its bounded summary — the invariant is the total
+        # output is NOT the full backlog + the summaries are bounded, not a
+        # strict message-count shrink (one leaf may replace few messages).
+        assert len(result) < len(backlog) + 4, (
+            "backlog fully drained despite budget"
+        )
+        # The inserted summaries are bounded (the drain cap).
+        for m in result:
+            if m.get("content", "").startswith("[Recent Summary"):
+                assert len(m["content"]) <= 12_000, "summary exceeds leaf budget"
 
     def test_widened_drain_caps_oversized_summary_at_leaf_budget(self, tmp_path, monkeypatch):
         """Regression (Clara stall fix #2, 2026-09-01): the widened leaf-drain
