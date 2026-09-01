@@ -12350,6 +12350,48 @@ class TestPostCompactionIngestion:
         # full backlog would have been (some backlog left for future passes).
         assert len(result) < len(backlog), "backlog fully drained despite budget"
 
+    def test_escalation_rejects_source_inclusive_echo_bounded_to_budget(self, tmp_path, monkeypatch):
+        """Regression (Clara stall 2026-09-01): summarize_with_escalation's
+        acceptance gate was count_tokens(result) < source_tokens — with a huge
+        widened chunk (2.2M source), a source-inclusive ~2.2M LLM echo was
+        ACCEPTED → 1000→9,223 message blowup (10x tokens). The accepted
+        summary must be <= the token BUDGET (12K cap), so the echo is rejected
+        and the run escalates to L2/L3 (deterministic truncation, bounded).
+        """
+        from hermes_lcm import escalation as esc_mod
+        from hermes_lcm.tokens import count_tokens
+
+        # A source-inclusive echo: a "summary" that copies the source (2.2M).
+        big_source = "s" * 2_000_000
+        captured = {}
+
+        def fake_invoke(l1_prompt, max_tokens, **kwargs):
+            accepts = kwargs.get("accepts_result")
+            captured["accepts"] = accepts
+            # L1 returns a source-inclusive echo (BIGGER than the 12K budget)
+            if not captured.get("attempted_l2"):
+                captured["attempted_l2"] = True
+                # Return an echo that is < source but > budget (the old gate
+                # would ACCEPT it; the new gate must reject it).
+                echo = "e" * 100_000  # 100K > 12K budget, < 2.2M source
+                return echo if accepts(echo) else None
+            # L2 also echoes (rejected), then L3 truncation converges.
+            return None
+
+        monkeypatch.setattr(esc_mod, "_invoke_summary_llm_chain", fake_invoke)
+
+        result, level = esc_mod.summarize_with_escalation(
+            text=big_source,
+            source_tokens=2_212_704,  # clara's case
+            token_budget=12_000,
+        )
+        # The result must be bounded (L3 truncation, ~512 tokens), NOT the
+        # 100K echo — the acceptance gate rejected it.
+        assert count_tokens(result) <= 12_000, (
+            f"summary {count_tokens(result)} tokens > budget — echo accepted (old bug)"
+        )
+        assert level == 3, f"expected L3 truncation, got level {level}"
+
     def _make_long_conversation(self, n_turns=20):
         messages = [{"role": "system", "content": "You are a helpful assistant."}]
         for i in range(n_turns):
