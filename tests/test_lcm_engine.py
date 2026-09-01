@@ -12350,6 +12350,70 @@ class TestPostCompactionIngestion:
         # full backlog would have been (some backlog left for future passes).
         assert len(result) < len(backlog), "backlog fully drained despite budget"
 
+    def test_widened_drain_caps_oversized_summary_at_leaf_budget(self, tmp_path, monkeypatch):
+        """Regression (Clara stall fix #2, 2026-09-01): the widened leaf-drain
+        path can produce a summary LARGER than the per-leaf budget when the
+        LLM echoes the source. The escalation gate covers summarize_with_
+        escalation, but the drain boundary must ALSO cap: a stored summary
+        must never exceed the leaf budget (20% of chunk source, capped 12K).
+        """
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        db_path = tmp_path / "widen-cap.db"
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=200,
+            database_path=str(db_path),
+        )
+        eng = LCMEngine(config=config)
+        eng.on_session_start(
+            "widen-cap-session",
+            platform="cli",
+            conversation_id="widen-cap-conversation",
+            context_length=200000,
+        )
+
+        # A large unsummarized store backlog (the widen source).
+        backlog = [
+            {"role": "assistant", "content": f"backlog message {idx} " + "x" * 120}
+            for idx in range(40)
+        ]
+        eng._store.append_batch("widen-cap-session", backlog)
+
+        def mock_summarize_with_rescue(messages, **kwargs):
+            # A source-inclusive echo: FAR larger than any leaf budget.
+            return (messages, len(messages), "E" * 100_000, 1, 0)
+
+        monkeypatch.setattr(
+            eng,
+            "_summarize_leaf_chunk_with_rescue",
+            mock_summarize_with_rescue,
+        )
+
+        active = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        out = eng.compress(active, force=True)
+
+        # The stored summary must be bounded (≤ the leaf budget cap), NOT the
+        # 100K echo — the drain cap truncated it.
+        node_summaries = [
+            n.summary for n in eng._dag.get_session_nodes("widen-cap-session") if n.depth == 0
+        ]
+        assert node_summaries, "no leaf nodes stored"
+        for s in node_summaries:
+            assert len(s) <= 12_000, (
+                f"summary {len(s)} chars > leaf budget — echo not capped"
+            )
+        assert any(len(s) < 100_000 for s in node_summaries), (
+            "all summaries are the 100K echo — drain cap did not fire"
+        )
+
     def test_escalation_rejects_source_inclusive_echo_bounded_to_budget(self, tmp_path, monkeypatch):
         """Regression (Clara stall 2026-09-01): summarize_with_escalation's
         acceptance gate was count_tokens(result) < source_tokens — with a huge

@@ -814,6 +814,29 @@ class CompactionMixin:
                         summary_input_chunk,
                         **summary_kwargs,
                     )
+                    # WIDENED-DRAIN BUDGET CAP (2026-09-01, Clara stall fix #2):
+                    # the escalation gate (≤ token_budget) lives inside
+                    # summarize_with_escalation, but the widened leaf path can
+                    # arrive here with a chunk whose source_tokens makes the
+                    # budget computation huge (20% of 2.2M → capped 12K is fine,
+                    # but a rescue-shrunk chunk can still produce a summary that
+                    # exceeds the per-leaf budget when the LLM echoes the
+                    # source). Enforce the per-leaf budget HERE at the drain
+                    # boundary: if the returned summary exceeds the chunk's
+                    # budget (leaf_chunk_tokens), replace it with the
+                    # deterministic truncation — the leaf must NEVER grow.
+                    leaf_budget = max(2000, min(int(source_tokens * 0.20), 12000))
+                    if count_tokens(summary_text) > leaf_budget:
+                        logger.warning(
+                            "LCM widened leaf drain: summary %d tokens > leaf budget %d — truncating to bounded deterministic summary",
+                            count_tokens(summary_text),
+                            leaf_budget,
+                        )
+                        from .escalation import _deterministic_truncate
+
+                        summary_text = _deterministic_truncate(
+                            summary_text, leaf_budget
+                        )
                 except Exception as exc:
                     if threshold_full_sweep_active and leaf_compacted_this_turn:
                         sweep_stop_reason = "leaf_summary_error"
