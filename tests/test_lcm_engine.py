@@ -20820,6 +20820,75 @@ class TestCondensationWithoutLeafCompaction:
         assert "STALE-CHILD-MARKER" not in result_text
         assert engine.compression_count == 0
 
+    def test_no_condensation_attempted_when_dag_holds_no_fan_in_group(
+        self, engine, monkeypatch
+    ):
+        """Negative arm for the debt guard.
+
+        The test above builds exactly ``fanin`` nodes, so ``_has_condensable_dag_debt()``
+        is always True in it and the guard is never exercised in the False direction.
+        A guard with no negative arm can be replaced by ``if True:`` and the suite stays
+        green, which means the guard can be deleted in silence. This is that arm: fewer
+        than fan-in uncondensed nodes at every depth, no eligible leaf chunk, and the
+        no-leaf branch must not attempt condensation at all.
+        """
+        session_id = engine._session_id
+        fanin = engine._config.condensation_fanin
+        assert fanin >= 2, "a fan-in below 2 cannot express a below-threshold group"
+        below = fanin - 1
+
+        for index in range(below):
+            engine._dag.add_node(SummaryNode(
+                session_id=session_id,
+                depth=0,
+                summary=f"below-threshold debt {index}",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[index + 1],
+                source_type="messages",
+                created_at=time.time() + index,
+                earliest_at=time.time(),
+                latest_at=time.time(),
+                expand_hint=f"below {index}",
+            ))
+        assert len(engine._dag.get_uncondensed_at_depth(session_id, 0)) == below
+        assert engine._has_condensable_dag_debt() is False
+
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {
+                "role": "user",
+                "content": (
+                    "[Recent Summary (d0, node 1)]\n"
+                    "STALE-CHILD-MARKER\n"
+                    "[Expand for details: stale child]"
+                ),
+            },
+            {"role": "user", "content": "fresh question"},
+            {"role": "assistant", "content": "fresh answer"},
+        ]
+        eligible, reason = engine._leaf_compaction_candidate_status(messages)
+        assert not eligible, reason
+
+        calls = []
+        original_maybe_condense = engine._maybe_condense
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("leaf_compacted_this_turn"))
+            return original_maybe_condense(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "_maybe_condense", spy)
+
+        engine.compress(messages)
+
+        assert calls == [], (
+            "condensation must not be attempted when no depth holds a fan-in group; "
+            f"called {len(calls)} time(s) with leaf_compacted_this_turn={calls}"
+        )
+        assert len(engine._dag.get_uncondensed_at_depth(session_id, 0)) == below
+        assert engine._dag.get_session_nodes(session_id, depth=1) == []
+        assert engine.compression_count == 0
+
 
 class TestConfigCleanup:
     """Tests for issue #2c follow-up — expansion path is now separate from summary-only config."""
