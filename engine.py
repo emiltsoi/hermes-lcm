@@ -1686,11 +1686,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
             serialized = self._serialize_messages(attempt_chunk)
-            source_store_ids = sorted(dict.fromkeys(
-                self._current_compress_store_ids_by_message_id[id(message)]
-                for message in attempt_chunk
-                if id(message) in self._current_compress_store_ids_by_message_id
-            ))
             token_budget = max(2000, int(source_tokens * 0.20))
             token_budget = min(token_budget, 12000)
 
@@ -1715,11 +1710,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
                     custom_instructions=self._config.custom_instructions,
-                    source_provenance={
-                        "source_type": "messages",
-                        "store_ids": source_store_ids,
-                        "message_count": len(attempt_chunk),
-                    },
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
@@ -2013,21 +2003,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         state = self._lifecycle.get_by_conversation(self._pending_reset_conversation_id)
         frontier_store_id = self._pending_reset_frontier_store_id
         if state is not None and state.current_session_id == session_id:
-            # The pending-reset session is STILL the conversation's current
-            # active binding — this is a gateway restart/resume, NOT a real
-            # session boundary. Finalizing it would orphan the live session's
-            # raw messages and reset its frontier to 0 (2026-08-23 bug: every
-            # restart re-finalized the active session, so the engine treated
-            # all messages as new debt and entered constant compression
-            # churn). Keep the session active and drop the pending reset.
-            logger.warning(
-                "LCM pending-reset boundary skipped: session %s is still the "
-                "current active binding (gateway restart/resume, not a session "
-                "boundary); keeping it active",
-                session_id,
+            frontier_store_id = max(
+                frontier_store_id,
+                int(state.current_frontier_store_id or 0),
             )
-            self._clear_pending_reset_boundary()
-            return
         self._lifecycle.finalize_session(
             self._pending_reset_conversation_id,
             self._pending_reset_session_id,
@@ -2102,11 +2081,40 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return 1
         return 0
 
+    def _durable_unreflected_backlog_tokens(self) -> int:
+        """Unreflected durable backlog owed to the DAG, in estimated tokens.
+
+        The assembled context window only carries a slice of the transcript;
+        host in-place commits and rotations push raw rows out of view while
+        they stay unreflected in the store. Window-only measurement then reads
+        a permanently-small middle and reports "nothing to compact" while a
+        multi-million-token backlog accumulates (hermes-lcm#585). Eligibility
+        and debt therefore consult the store frontier, which tracks real
+        coverage; the window middle remains the compaction input itself.
+        """
+        conversation_id = self._conversation_id
+        if not conversation_id or self._store is None:
+            return 0
+        try:
+            state = self._lifecycle.get_by_conversation(conversation_id)
+            frontier = max(
+                int(self._last_compacted_store_id or 0),
+                int(state.current_frontier_store_id if state else 0),
+                int(state.last_finalized_frontier_store_id if state else 0),
+            )
+            return self._store.sum_unreflected_backlog_tokens(
+                conversation_id,
+                frontier,
+                session_id=self._session_id or "",
+                fresh_tail_count=int(self._config.fresh_tail_count or 0),
+            )
+        except Exception:
+            return 0
+
     def _raw_backlog_tokens(self, messages: List[Dict[str, Any]]) -> int:
         backlog = self._raw_backlog_messages(messages)
-        if not backlog:
-            return 0
-        return count_messages_tokens(backlog)
+        window_tokens = count_messages_tokens(backlog) if backlog else 0
+        return max(window_tokens, self._durable_unreflected_backlog_tokens())
 
     def _raw_backlog_threshold(self, raw_tokens: int) -> int:
         if self._config.dynamic_leaf_chunk_enabled:
@@ -3529,30 +3537,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     raise
 
                 try:
-                    # Only finalize when compaction actually produced a frontier
-                    # or summary nodes exist. A session ending with ZERO
-                    # compaction (gateway restart/crash, session-end without a
-                    # boundary) must stay the live session — finalizing it
-                    # orphans its raw messages and permanently disables
-                    # compression on the next process (2026-08-22/23 bug:
-                    # every restart created a new empty lifecycle row and
-                    # froze the real session as last_finalized_session_id).
-                    has_compaction = (
-                        int(self._last_compacted_store_id or 0) > 0
-                        or bool(self._dag.get_session_nodes(session_id))
+                    self._lifecycle.finalize_session(
+                        self._conversation_id,
+                        session_id,
+                        frontier_store_id=self._last_compacted_store_id,
                     )
-                    if has_compaction:
-                        self._lifecycle.finalize_session(
-                            self._conversation_id,
-                            session_id,
-                            frontier_store_id=self._last_compacted_store_id,
-                        )
-                    else:
-                        logger.warning(
-                            "LCM session-end %s had zero compaction; leaving as active "
-                            "session so a restart rebinds instead of finalizing it",
-                            session_id,
-                        )
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end lifecycle finalization interrupted; "
@@ -5687,11 +5676,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
-            source_provenance={
-                "source_type": "summary_nodes",
-                "node_ids": [node.node_id for node in nodes],
-                "source_depth": depth,
-            },
         )
         earliest_at, latest_at = self._dag.get_source_time_window(
             [node.node_id for node in nodes]

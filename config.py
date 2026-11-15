@@ -324,6 +324,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
+    _EnvFieldSpec("min_partial_leaf_tokens", "LCM_MIN_PARTIAL_LEAF_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
@@ -486,6 +487,12 @@ class LCMConfig:
     threshold_full_sweep_enabled: bool = False
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
+    # Minimum window-carried raw middle for a partial leaf pass under a
+    # durable store backlog (0 = disabled). A gated pass is skipped and its
+    # debt retained; a later pass compacts once the middle is worth the
+    # provider cache generation it breaks. Full-chunk, sweep, and
+    # force-overflow paths are not gated.
+    min_partial_leaf_tokens: int = 0
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1

@@ -319,6 +319,15 @@ class CompactionMixin:
         else:
             working_leaf_chunk_tokens = self._config.leaf_chunk_tokens
         if raw_tokens_outside_tail < working_leaf_chunk_tokens:
+            # The window middle may be thin while the durable store still owes
+            # the DAG a full chunk — host in-place commits and rotations push
+            # unreflected rows out of the assembled window (hermes-lcm#585).
+            # Eligibility follows the durable backlog so maintenance keeps
+            # chipping whatever raw middle the window currently carries.
+            if self._durable_unreflected_backlog_tokens() >= working_leaf_chunk_tokens:
+                if self._min_partial_leaf_blocks_chip(raw_tokens_outside_tail):
+                    return False, "raw middle below minimum partial leaf tokens"
+                return True, "eligible partial leaf under durable store backlog"
             return False, "raw backlog outside fresh tail is below leaf chunk threshold"
         return True, "eligible raw backlog outside fresh tail"
 
@@ -331,6 +340,25 @@ class CompactionMixin:
         while working < ceiling and raw_tokens_outside_tail > working * 2:
             working = min(ceiling, working * 2)
         return working
+
+    def _min_partial_leaf_blocks_chip(self, raw_tokens_outside_tail: int) -> bool:
+        """Return True when the minimum partial-leaf size gates a leaf pass.
+
+        While the durable store owes the DAG a full chunk, the window middle
+        can be arbitrarily thin and a partial leaf pass would still chip it —
+        each pass replaces the active context and breaks a provider cache
+        generation for a sub-1% reduction. With ``LCM_MIN_PARTIAL_LEAF_TOKENS``
+        set (> 0), a middle below the minimum is skipped; debt recording keeps
+        the maintenance signal alive and a later pass compacts once the middle
+        is worth the cache break. ``0`` (default) disables the gate.
+        """
+        try:
+            minimum = int(self._config.min_partial_leaf_tokens or 0)
+        except (TypeError, ValueError):
+            # Fail open: an unparseable value disables the gate (the default
+            # behavior) rather than crashing the maintenance pass.
+            minimum = 0
+        return minimum > 0 and raw_tokens_outside_tail < minimum
 
     def _select_oldest_leaf_chunk(
         self,
@@ -674,10 +702,13 @@ class CompactionMixin:
             elif self._config.dynamic_leaf_chunk_enabled:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
                 if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
+                    if not deferred_maintenance_active:
                         noop_reason = (
                             "raw backlog outside fresh tail is below leaf chunk threshold"
                         )
+                        break
+                    if self._min_partial_leaf_blocks_chip(raw_tokens_outside_tail):
+                        noop_reason = "raw middle below minimum partial leaf tokens"
                         break
                 if force_overflow:
                     to_compact = candidate_raw
@@ -685,10 +716,13 @@ class CompactionMixin:
                     to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
                 if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
+                    if not deferred_maintenance_active:
                         noop_reason = (
                             "raw backlog outside fresh tail is below leaf chunk threshold"
                         )
+                        break
+                    if self._min_partial_leaf_blocks_chip(raw_tokens_outside_tail):
+                        noop_reason = "raw middle below minimum partial leaf tokens"
                         break
                 to_compact = candidate_raw
 
@@ -837,7 +871,13 @@ class CompactionMixin:
                 remaining_raw_tokens = count_messages_tokens(pressure_remaining_raw)
                 remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)
                 if remaining_raw_tokens < remaining_threshold:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
+                    if not deferred_maintenance_active:
+                        break
+                    # Defense-in-depth: the next iteration's chip-selection gate
+                    # applies the same predicate, so this short-circuit is not
+                    # independently observable — it only skips a cheap preamble
+                    # pass over the remainder.
+                    if self._min_partial_leaf_blocks_chip(remaining_raw_tokens):
                         break
 
         if (
