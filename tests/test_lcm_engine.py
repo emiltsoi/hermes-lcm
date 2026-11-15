@@ -20761,6 +20761,66 @@ class TestUnlimitedCondensationDepth:
             esc._call_llm_for_summary = original_fn
 
 
+class TestCondensationWithoutLeafCompaction:
+    """A saturated DAG must still collapse on a turn that has no leaf work."""
+
+    def test_no_leaf_turn_condenses_saturated_dag_and_reassembles_context(
+        self, engine, monkeypatch
+    ):
+        session_id = engine._session_id
+        fanin = engine._config.condensation_fanin
+        for index in range(fanin):
+            engine._dag.add_node(SummaryNode(
+                session_id=session_id,
+                depth=0,
+                summary=f"depth-zero debt {index}",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[index + 1],
+                source_type="messages",
+                created_at=time.time() + index,
+                earliest_at=time.time(),
+                latest_at=time.time(),
+                expand_hint=f"debt {index}",
+            ))
+        assert len(engine._dag.get_uncondensed_at_depth(session_id, 0)) == fanin
+
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {
+                "role": "user",
+                "content": (
+                    "[Recent Summary (d0, node 1)]\n"
+                    "STALE-CHILD-MARKER\n"
+                    "[Expand for details: stale child]"
+                ),
+            },
+            {"role": "user", "content": "fresh question"},
+            {"role": "assistant", "content": "fresh answer"},
+        ]
+        eligible, reason = engine._leaf_compaction_candidate_status(messages)
+        assert not eligible, reason
+
+        def mock_summary(**_kwargs):
+            return (
+                "Condensed debt summary.\n"
+                "Expand for details about: depth-zero debt",
+                1,
+            )
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        result = engine.compress(messages)
+
+        assert len(engine._dag.get_uncondensed_at_depth(session_id, 0)) < fanin
+        assert engine._dag.get_uncondensed_at_depth(session_id, 0) == []
+        assert len(engine._dag.get_session_nodes(session_id, depth=1)) == 1
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+        assert "Condensed debt summary." in result_text
+        assert "STALE-CHILD-MARKER" not in result_text
+        assert engine.compression_count == 0
+
+
 class TestConfigCleanup:
     """Tests for issue #2c follow-up — expansion path is now separate from summary-only config."""
 

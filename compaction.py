@@ -375,6 +375,47 @@ class CompactionMixin:
             used += msg_tokens
         return selected
 
+    def _has_condensable_dag_debt(self) -> bool:
+        """Return whether a depth has a fan-in group ready to condense.
+
+        Mirrors the depth walk in ``_maybe_condense`` so the no-leaf return
+        path only attempts condensation when it can make progress.
+        """
+        max_depth = self._config.incremental_max_depth
+        if max_depth == 0:
+            return False
+        fanin = max(1, self._config.condensation_fanin)
+        if max_depth < 0:
+            nodes = self._dag.get_session_nodes(self._session_id)
+            upper = (max(node.depth for node in nodes) + 1) if nodes else 1
+        else:
+            upper = max_depth
+        return any(
+            len(self._dag.get_uncondensed_at_depth(self._session_id, depth)) >= fanin
+            for depth in range(upper)
+        )
+
+    def _drop_replayed_summary_scaffolds(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Drop stale synthetic summaries before assembly.
+
+        ``_assemble_context`` rebuilds the summary prefix from the DAG, so a
+        replayed summary block left in the tail would duplicate (or contradict)
+        the collapsed frontier. Preserved-objective and system scaffolding are
+        not summary blocks and stay in place.
+        """
+        kept: list[Dict[str, Any]] = []
+        for message in messages:
+            if (
+                message.get("role") != "system"
+                and not self._preserved_objective_context_content(message)
+                and self._is_replayed_context_scaffold_message(message)
+            ):
+                continue
+            kept.append(message)
+        return kept
+
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
@@ -893,6 +934,21 @@ class CompactionMixin:
                 working_messages,
                 observed_tokens=observed_prompt_tokens,
             )
+            condensed_this_turn = False
+            if self._has_condensable_dag_debt():
+                frontier_before = {
+                    node.node_id for node in self._summary_frontier_nodes()
+                }
+                self._maybe_condense(
+                    focus_topic=focus_topic,
+                    leaf_compacted_this_turn=False,
+                    force_overflow=force_overflow,
+                    critical_budget_pressure=critical_budget_pressure,
+                )
+                frontier_after = {
+                    node.node_id for node in self._summary_frontier_nodes()
+                }
+                condensed_this_turn = frontier_before != frontier_after
             if force_overflow and len(messages) >= 1:
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 compressed = self._assemble_overflow_recovery_context(
@@ -910,9 +966,16 @@ class CompactionMixin:
                 working_messages,
                 preexisting_dependent_reply_records,
             )
-            if dropped_replayed_scaffold_messages:
+            if dropped_replayed_scaffold_messages or condensed_this_turn:
                 leading_anchor_count = self._leading_anchor_count(active_context_messages)
                 anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
+                if condensed_this_turn:
+                    active_context_messages = (
+                        active_context_messages[:leading_anchor_count]
+                        + self._drop_replayed_summary_scaffolds(
+                            active_context_messages[leading_anchor_count:]
+                        )
+                    )
                 self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
                 try:
                     sanitized_messages = self._assemble_context(
